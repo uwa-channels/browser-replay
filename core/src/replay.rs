@@ -133,11 +133,26 @@ fn validate_inputs(input_len: usize, fs: f64, array_index: &[usize], channel: &C
 /// `array_index` (0-based). `start` is the raw sample offset into the
 /// channel's delay-domain timeline (matching the reference `start` argument
 /// exactly — see `valid_start_range` for how to pick one).
-pub fn replay(input: &[f64], fs: f64, array_index: &[usize], channel: &Channel, start: i64) -> Result<Vec<Vec<f64>>, String> {
+///
+/// `fc_override`, when given, replaces the channel's own `fc` everywhere the
+/// replay uses a carrier: the down/upconversion and (for `phi_hat` channels)
+/// the phase-to-delay-drift conversion. Passing `B / 2`, where `B` is the
+/// channel's bandwidth (`fs_delay / 2`, the delay domain being sampled at two
+/// samples per symbol), puts the output band at `[0, B]` instead of around the
+/// measured carrier -- that's the UI's audible-band option. The reference
+/// implementation has no such knob -- pass `None` to match it exactly.
+pub fn replay(
+    input: &[f64],
+    fs: f64,
+    array_index: &[usize],
+    channel: &Channel,
+    start: i64,
+    fc_override: Option<f64>,
+) -> Result<Vec<Vec<f64>>, String> {
     validate_inputs(input.len(), fs, array_index, channel)?;
 
     let fs_delay = channel.params.fs_delay;
-    let fc = channel.params.fc;
+    let fc = fc_override.unwrap_or(channel.params.fc);
     let l = channel.h_hat.l;
 
     // Downconvert to baseband, then resample fs -> fs_delay. The exact (p, q)
@@ -298,6 +313,33 @@ mod tests {
                 assert_eq!(mag[l_idx + 3 * t_idx], ch.h_hat.get(l_idx, 1, t_idx).norm());
             }
         }
+    }
+
+    /// A tone inside [0, B] (B = fs_delay/2) survives only when the replay uses
+    /// the shifted carrier B/2; at the channel's own (much higher) fc the same
+    /// tone falls outside the downconverted passband and the anti-alias filter
+    /// of the resample to fs_delay removes it.
+    #[test]
+    fn fc_override_replays_a_low_band_tone_the_channels_fc_would_reject() {
+        let (l, m, t) = (1, 1, 50);
+        let mut ch = tiny_channel(l, m, t, 8000.0, 100.0);
+        ch.h_hat = Cir::new(l, m, t, vec![Complex64::new(1.0, 0.0); l * m * t]);
+        ch.params.fc = 16_000.0;
+
+        let bandwidth = ch.params.fs_delay / 2.0; // 4 kHz, so the shifted carrier is 2 kHz
+        let fs = 48_000.0;
+        let input: Vec<f64> = (0..4800).map(|n| (2.0 * PI * 2000.0 * n as f64 / fs).sin()).collect();
+        let energy = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>();
+
+        let shifted = replay(&input, fs, &[0], &ch, 1, Some(bandwidth / 2.0)).unwrap();
+        let at_channel_fc = replay(&input, fs, &[0], &ch, 1, None).unwrap();
+
+        assert!(
+            energy(&shifted[0]) > 100.0 * energy(&at_channel_fc[0]),
+            "shifted energy {} should dwarf {}",
+            energy(&shifted[0]),
+            energy(&at_channel_fc[0])
+        );
     }
 
     #[test]

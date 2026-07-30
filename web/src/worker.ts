@@ -29,7 +29,7 @@ type Request =
   | { id: number; type: "validStartRange"; fs: number; inputLen: number }
   | { id: number; type: "cirMagnitude"; mIdx: number }
   | { id: number; type: "replayTimeRange"; fs: number; inputLen: number; start: string }
-  | { id: number; type: "runReplay"; input: number[]; fs: number; arrayIndex: number[]; start: string }
+  | { id: number; type: "runReplay"; input: number[]; fs: number; arrayIndex: number[]; start: string; fcOverride: number | null }
   | { id: number; type: "runNoisePink"; rows: number; cols: number; fs: number; seed: string }
   | { id: number; type: "runNoiseMixing"; rows: number; arrayIndex: number[]; fs: number; seed: string }
   | { id: number; type: "spectrogram"; x: number[]; fs: number; windowLen: number; hop: number };
@@ -92,7 +92,14 @@ self.onmessage = async (ev: MessageEvent<Request>) => {
       }
       case "runReplay": {
         if (!channel) throw new Error("No channel loaded");
-        const flat = replay_js(Float64Array.from(req.input), req.fs, Uint32Array.from(req.arrayIndex), channel, BigInt(req.start));
+        const flat = replay_js(
+          Float64Array.from(req.input),
+          req.fs,
+          Uint32Array.from(req.arrayIndex),
+          channel,
+          BigInt(req.start),
+          req.fcOverride,
+        );
         const cols = req.arrayIndex.length;
         const rows = cols > 0 ? flat.length / cols : 0;
         post({ id: req.id, type: "result", payload: { flat: Array.from(flat), rows, cols } });

@@ -93,8 +93,10 @@ export class ReplayWorkerClient {
     return this.call({ type: "replayTimeRange", fs, inputLen, start });
   }
 
-  runReplay(input: number[], fs: number, arrayIndex: number[], start: string): Promise<FlatMatrix> {
-    return this.call({ type: "runReplay", input, fs, arrayIndex, start });
+  /** `fcOverride` replaces the channel file's own fc for this replay (null =
+   * use the file's fc); `fsDelay / 2` lands the output in `[0, fsDelay]`. */
+  runReplay(input: number[], fs: number, arrayIndex: number[], start: string, fcOverride: number | null = null): Promise<FlatMatrix> {
+    return this.call({ type: "runReplay", input, fs, arrayIndex, start, fcOverride });
   }
 
   runNoisePink(rows: number, cols: number, fs: number, seed: string): Promise<FlatMatrix> {

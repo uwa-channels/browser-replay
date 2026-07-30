@@ -84,10 +84,20 @@ impl WasmChannel {
 /// Replays `input` through `channel`, returning the per-receiver outputs
 /// flattened column-major (`[rows, array_index.len()]`, so
 /// `output[row + rows*col]`); `rows` is `output.len() / array_index.len()`.
+///
+/// `fc_override` (pass `undefined`/`null` for the channel's own `fc`) swaps in
+/// a different carrier for the replay -- see [`replay::replay`].
 #[wasm_bindgen]
-pub fn replay_js(input: Vec<f64>, fs: f64, array_index: Vec<u32>, channel: &WasmChannel, start: i64) -> Result<Vec<f64>, JsValue> {
+pub fn replay_js(
+    input: Vec<f64>,
+    fs: f64,
+    array_index: Vec<u32>,
+    channel: &WasmChannel,
+    start: i64,
+    fc_override: Option<f64>,
+) -> Result<Vec<f64>, JsValue> {
     let idx: Vec<usize> = array_index.into_iter().map(|v| v as usize).collect();
-    let outputs = replay::replay(&input, fs, &idx, &channel.inner, start).map_err(|e| JsValue::from_str(&e))?;
+    let outputs = replay::replay(&input, fs, &idx, &channel.inner, start, fc_override).map_err(|e| JsValue::from_str(&e))?;
     let mut flat = Vec::with_capacity(outputs.iter().map(|c| c.len()).sum());
     for col in &outputs {
         flat.extend_from_slice(col);

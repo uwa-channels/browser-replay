@@ -1,5 +1,5 @@
 .app {
-  max-width: 760px;
+  max-width: 1040px;
   margin: 0 auto;
   padding: 24px 20px 64px;
 }
@@ -294,4 +294,5 @@ header p {
   display: flex;
   gap: 12px;
   flex-wrap: wrap;
+  justify-content: center;
 }

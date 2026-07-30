@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { ChannelPicker } from "./components/ChannelPicker";
+import { PlayButton } from "./components/PlayButton";
 import { SpectrogramCanvas } from "./components/SpectrogramCanvas";
 import { CirCanvas, type CirData } from "./components/CirCanvas";
 import { buildChannelList, downloadFile, fetchCatalog, type ChannelEntry } from "./lib/zenodo";
@@ -9,8 +10,35 @@ import { ReplayWorkerClient, type ChannelInfo, type NoiseInfo, type SpectrogramR
 
 type NoiseMode = "none" | "pink" | "mixing";
 
+/** Everything a replay run needs, kept so the same run can be recomputed at a
+ * different carrier (the audible-band option) without re-randomizing the start
+ * offset or the noise realization. */
+interface RunParams {
+  samples: Float64Array;
+  sampleRate: number;
+  arrayIndex: number[];
+  start: string;
+  noiseMode: NoiseMode;
+  noiseScale: number;
+  noiseSeed: string;
+}
+
 function randomSeed(): string {
   return BigInt(Math.floor(Math.random() * 2 ** 32)).toString();
+}
+
+function formatHz(hz: number): string {
+  return hz >= 1000 ? `${Number((hz / 1000).toFixed(3))} kHz` : `${Math.round(hz)} Hz`;
+}
+
+// Bigger window for finer frequency bins, finer hop (75% overlap) for more
+// time frames -- more resolution on both axes at the cost of more STFT frames
+// to compute (still fast: this is a WASM STFT over at most a few hundred
+// thousand samples). Shared by every spectrogram of a given run so they're
+// directly comparable.
+function specParams(inputLen: number): { windowLen: number; hop: number } {
+  const windowLen = Math.min(2048, Math.max(128, Math.floor(inputLen / 6)));
+  return { windowLen, hop: Math.max(1, Math.floor(windowLen / 4)) };
 }
 
 function parseArrayIndex(text: string): number[] {
@@ -71,6 +99,17 @@ function App() {
   const [output, setOutput] = useState<{ rows: number; cols: number; flat: number[] } | null>(null);
   const [inputSpec, setInputSpec] = useState<SpectrogramResult | null>(null);
   const [outputSpec, setOutputSpec] = useState<SpectrogramResult | null>(null);
+  const [lastRun, setLastRun] = useState<RunParams | null>(null);
+  // Bumped by every completed run, so playback of a superseded result stops
+  // and the cached audible-band replay below is recognized as stale.
+  const [runId, setRunId] = useState(0);
+  // Channel 1 of the audible-band (fc = B/2) replay. Only computed when it's
+  // actually asked for, and kept in a ref because nothing renders from it.
+  const audibleRef = useRef<{ runId: number; samples: number[] } | null>(null);
+  const [audibleSpec, setAudibleSpec] = useState<SpectrogramResult | null>(null);
+  // Which output variant the results section is showing: the replay at the
+  // channel file's fc, or the audible-band one. Follows whichever was played.
+  const [showAudible, setShowAudible] = useState(false);
 
   useEffect(() => {
     fetchCatalog()
@@ -205,6 +244,24 @@ function App() {
     }
   }
 
+  /** Runs the replay for `p` and adds its noise, at the channel's own carrier
+   * (`fcOverride` null) or at a substituted one. */
+  async function computeOutput(p: RunParams, fcOverride: number | null) {
+    const worker = workerRef.current!;
+    const input = Array.from(p.samples);
+    const replayResult = await worker.runReplay(input, p.sampleRate, p.arrayIndex, p.start, fcOverride);
+
+    let flat = replayResult.flat;
+    if (p.noiseMode === "pink") {
+      const n = await worker.runNoisePink(replayResult.rows, replayResult.cols, p.sampleRate, p.noiseSeed);
+      flat = flat.map((v, i) => v + p.noiseScale * n.flat[i]);
+    } else if (p.noiseMode === "mixing") {
+      const n = await worker.runNoiseMixing(replayResult.rows, p.arrayIndex, p.sampleRate, p.noiseSeed);
+      flat = flat.map((v, i) => v + p.noiseScale * n.flat[i]);
+    }
+    return { rows: replayResult.rows, cols: replayResult.cols, flat };
+  }
+
   async function handleRun() {
     if (!channelInfo || !signal) return;
     setBusy(true);
@@ -213,38 +270,39 @@ function App() {
       const worker = workerRef.current!;
       const arrayIndex = parseArrayIndex(arrayIndexText);
       if (arrayIndex.length === 0) throw new Error("Enter at least one hydrophone index (e.g. 1 or 1,2,3)");
+      if (noiseMode === "mixing" && !noiseInfo) throw new Error("This channel has no paired noise file for the mixing model");
 
-      const input = Array.from(signal.samples);
-      const [lo, hi] = await worker.validStartRange(signal.sampleRate, input.length);
+      const inputLen = signal.samples.length;
+      const [lo, hi] = await worker.validStartRange(signal.sampleRate, inputLen);
       const loBig = BigInt(lo);
       const hiBig = BigInt(hi);
       const span = hiBig - loBig;
       const start = span > 0n ? (loBig + BigInt(Math.floor(Math.random() * Number(span)))).toString() : loBig.toString();
 
-      const [segStart, segEnd] = await worker.replayTimeRange(signal.sampleRate, input.length, start);
+      const [segStart, segEnd] = await worker.replayTimeRange(signal.sampleRate, inputLen, start);
       setReplaySegment([segStart, segEnd]);
 
-      const replayResult = await worker.runReplay(input, signal.sampleRate, arrayIndex, start);
+      const params: RunParams = {
+        samples: signal.samples,
+        sampleRate: signal.sampleRate,
+        arrayIndex,
+        start,
+        noiseMode,
+        noiseScale,
+        noiseSeed: randomSeed(),
+      };
+      const result = await computeOutput(params, null);
+      setOutput(result);
+      setLastRun(params);
+      // The previous run's shifted replay no longer applies.
+      audibleRef.current = null;
+      setAudibleSpec(null);
+      setShowAudible(false);
+      setRunId((n) => n + 1);
 
-      let flat = replayResult.flat;
-      if (noiseMode === "pink") {
-        const n = await worker.runNoisePink(replayResult.rows, replayResult.cols, signal.sampleRate, randomSeed());
-        flat = flat.map((v, i) => v + noiseScale * n.flat[i]);
-      } else if (noiseMode === "mixing") {
-        if (!noiseInfo) throw new Error("This channel has no paired noise file for the mixing model");
-        const n = await worker.runNoiseMixing(replayResult.rows, arrayIndex, signal.sampleRate, randomSeed());
-        flat = flat.map((v, i) => v + noiseScale * n.flat[i]);
-      }
-
-      setOutput({ rows: replayResult.rows, cols: replayResult.cols, flat });
-
-      const firstCol = flat.slice(0, replayResult.rows);
-      // Bigger window for finer frequency bins, finer hop (75% overlap) for
-      // more time frames -- more resolution on both axes at the cost of
-      // more STFT frames to compute (still fast: this is a WASM STFT over
-      // at most a few hundred thousand samples).
-      const windowLen = Math.min(2048, Math.max(128, Math.floor(input.length / 6)));
-      const hop = Math.max(1, Math.floor(windowLen / 4));
+      const input = Array.from(signal.samples);
+      const firstCol = result.flat.slice(0, result.rows);
+      const { windowLen, hop } = specParams(input.length);
 
       const [inSpec, outSpec] = await Promise.all([
         worker.spectrogram(input, signal.sampleRate, windowLen, hop),
@@ -254,6 +312,42 @@ function App() {
       setOutputSpec(outSpec);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Channel 1 of the output -- the channel whose spectrogram is shown, and the
+  // one the play button auditions.
+  const outputCh1 = useMemo(() => (output ? output.flat.slice(0, output.rows) : null), [output]);
+
+  // The channel's bandwidth B is fs_delay / 2 (the delay domain is sampled at
+  // two samples per symbol -- the same relationship SpectrogramCanvas's
+  // zoom-to-bandwidth assumes), so a carrier of B/2 puts the replayed band at
+  // [0, B]: audible, unlike the measured carrier.
+  const bandwidth = channelInfo ? channelInfo.fsDelay / 2 : null;
+  const audibleFc = bandwidth != null ? bandwidth / 2 : null;
+
+  /** Re-runs the last replay with fc = B/2 (same start offset, same noise
+   * realization, so the carrier is the only difference), returning channel 1
+   * and computing its spectrogram. Both are cached for as long as that run is
+   * the current one. */
+  async function prepareAudibleBand(): Promise<number[] | null> {
+    if (!lastRun || audibleFc == null) return null;
+    const cached = audibleRef.current;
+    if (cached && cached.runId === runId) return cached.samples;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await computeOutput(lastRun, audibleFc);
+      const ch1 = result.flat.slice(0, result.rows);
+      audibleRef.current = { runId, samples: ch1 };
+      const { windowLen, hop } = specParams(lastRun.samples.length);
+      setAudibleSpec(await workerRef.current!.spectrogram(ch1, lastRun.sampleRate, windowLen, hop));
+      return ch1;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      return null;
     } finally {
       setBusy(false);
     }
@@ -498,18 +592,60 @@ function App() {
               fsDelay={channelInfo?.fsDelay}
             />
             <SpectrogramCanvas
-              spec={outputSpec}
-              label="Output signal (channel 1)"
-              fc={channelInfo?.fc}
+              spec={showAudible ? audibleSpec : outputSpec}
+              label={
+                showAudible && bandwidth != null && audibleFc != null
+                  ? `Output signal (channel 1), shifted to 0–${formatHz(bandwidth)} (fc = ${formatHz(audibleFc)})`
+                  : `Output signal (channel 1)${channelInfo ? `, at the file's fc = ${formatHz(channelInfo.fc)}` : ""}`
+              }
+              fc={showAudible ? (audibleFc ?? undefined) : channelInfo?.fc}
               fsDelay={channelInfo?.fsDelay}
             />
           </div>
-          {output && (
-            <div className="downloads">
-              <button onClick={downloadOutput}>
-                Download output ({output.cols}-channel WAV)
-              </button>
-            </div>
+          {output && signal && (
+            <>
+              <div className="downloads">
+                <PlayButton
+                  samples={outputCh1}
+                  sampleRate={signal.sampleRate}
+                  label={output.cols > 1 ? "Play output (channel 1)" : "Play output"}
+                  disabled={busy}
+                  onPlay={() => setShowAudible(false)}
+                  invalidateKey={runId}
+                />
+                {bandwidth != null && audibleFc != null && (
+                  <PlayButton
+                    prepare={prepareAudibleBand}
+                    sampleRate={signal.sampleRate}
+                    label={`Play shifted to 0–${formatHz(bandwidth)}`}
+                    disabled={busy}
+                    onPlay={() => setShowAudible(true)}
+                    invalidateKey={runId}
+                  />
+                )}
+                <button onClick={downloadOutput}>
+                  Download output at the file's fc ({output.cols}-channel WAV)
+                </button>
+              </div>
+              <div className="info">
+                {showAudible && bandwidth != null && audibleFc != null ? (
+                  <>
+                    Showing the shifted replay: fc = B/2 = {formatHz(audibleFc)} instead of the file's fc ={" "}
+                    {formatHz(channelInfo!.fc)}, so the output lands in 0–{formatHz(bandwidth)} and is audible. Same start offset and noise
+                    realization as the run above, so the carrier is the only difference. Play the unshifted output to switch this plot back;
+                    the download always writes the replay at the file's fc.
+                  </>
+                ) : (
+                  <>
+                    Showing the replay at the channel file's fc.
+                    {bandwidth != null && audibleFc != null && (
+                      <> Playing the shifted version re-runs it with fc = B/2 = {formatHz(audibleFc)} and updates this plot.</>
+                    )}
+                  </>
+                )}{" "}
+                Playback is peak-normalized to ±1; the downloaded WAV keeps the raw amplitudes.
+              </div>
+            </>
           )}
         </section>
       )}
